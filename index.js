@@ -195,9 +195,8 @@ app.get("/audit", async (req, res) => {
 
     const timestamp = Date.now();
     const domain = new URL(url).hostname.replace(/^www\./, "");
-    const baseName = `${domain}-${timestamp}`;
-    const jsonFilename = `${baseName}.json`;
-    const htmlFilename = `${baseName}.html`;
+    const jsonFilename = `${domain}.json`;
+    const htmlFilename = `${domain}.html`;
 
     const combinedReport = {
       requestedUrl: url,
