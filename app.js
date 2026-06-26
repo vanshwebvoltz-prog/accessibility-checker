@@ -261,8 +261,68 @@ async function start() {
   fs.mkdirSync(REPORTS_DIR, { recursive: true });
 
   browser = await puppeteer.launch({
-    headless: "new",
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    headless: true,          // Puppeteer 22+ maps this to --headless=new (no visible window)
+    ignoreHTTPSErrors: true, // don't bail on self-signed certs on staging sites
+    // NOTE: pipe:true is intentionally omitted — Windows has IPC-pipe timing
+    //       issues with Chrome that can cause a black window to flash.
+
+    args: [
+      // ── Headless guarantee ─────────────────────────────────────────────────
+      "--headless=new",                    // belt-and-suspenders: Chrome native headless
+      "--window-position=-32000,-32000",   // push any stray window completely off-screen
+      "--window-size=1280,800",            // explicit size prevents Chrome guessing
+
+      // ── Sandbox (required in most CI / container environments) ────────────
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+
+      // ── Memory & process model ─────────────────────────────────────────────
+      "--disable-dev-shm-usage",           // prevents /dev/shm exhaustion on Linux
+      "--disable-gpu",                     // no GPU process = no GPU VRAM allocation
+      "--disable-software-rasterizer",     // skip the fallback software GL layer
+      "--no-zygote",                       // skip the zygote helper process
+      "--renderer-process-limit=1",        // cap concurrent renderer processes
+      "--js-flags=--max-old-space-size=512", // hard cap V8 heap at 512 MB per page
+
+      // ── Disk / network cache ───────────────────────────────────────────────
+      "--disk-cache-size=0",               // no persistent disk cache between audits
+      "--media-cache-size=0",
+
+      // ── Color accuracy (critical for contrast ratio calculations) ──────────
+      "--force-color-profile=srgb",        // consistent sRGB for getComputedStyle color values
+
+      // ── Unused services (each removed = fewer threads + less RAM) ─────────
+      "--disable-background-networking",
+      "--disable-background-timer-throttling",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-breakpad",                // no crash reporter
+      "--disable-client-side-phishing-detection",
+      "--disable-component-update",
+      "--disable-default-apps",
+      "--disable-domain-reliability",
+      "--disable-extensions",
+      "--disable-features=AudioServiceOutOfProcess,TranslateUI,Translate",
+      "--disable-hang-monitor",
+      "--disable-ipc-flooding-protection",
+      "--disable-notifications",
+      "--disable-popup-blocking",          // keep open — some sites redirect via popup
+      "--disable-print-preview",
+      "--disable-renderer-backgrounding",
+      "--disable-speech-api",
+      "--disable-sync",
+      "--disable-translate",
+      "--disable-webgl",                   // WebGL unused for accessibility auditing
+      "--hide-scrollbars",
+      "--metrics-recording-only",
+      "--mute-audio",
+      "--no-default-browser-check",
+      "--no-first-run",
+      "--no-pings",
+      "--password-store=basic",
+      "--use-mock-keychain",
+      "--safebrowsing-disable-auto-update",
+      "--log-level=3",                     // only fatal messages in Chrome's own log
+    ],
   });
 
   setInterval(cleanupOldReports, 60 * 60 * 1000); // hourly
