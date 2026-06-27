@@ -5,13 +5,15 @@
   "main": "app.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "nodemon index.js",
+    "upload": "node uploadReports.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1075.0",
     "axe-core": "^4.12.1",
     "axe-html-reporter": "^2.2.11",
     "express": "^5.2.1",

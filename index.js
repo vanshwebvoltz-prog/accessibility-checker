@@ -13,13 +13,11 @@ const { customChecks, customRules, CUSTOM_RULE_IDS } = require("./customAxeRules
 const app = express();
 const PORT = process.env.PORT || 3000;
 const REPORTS_DIR = path.join(__dirname, "reports");
+const MAX_CRAWL_PAGES = 20;
 
 let browser; // single shared browser instance
 
 // ---------- SSRF protection ----------
-// NOTE: currently disabled per your edit. Re-enabling this is strongly
-// recommended before this is exposed to any untrusted input — see the
-// isUrlSafe() function below, just call it before page.goto() again.
 async function isUrlSafe(rawUrl) {
   let parsed;
   try {
@@ -50,6 +48,29 @@ async function isUrlSafe(rawUrl) {
   return true;
 }
 
+// ---------- URL normalisation ----------
+// Returns true for locale-prefixed paths like /fr/, /de/, /es/ etc.
+function isLocaleUrl(rawUrl) {
+  try {
+    const { pathname } = new URL(rawUrl);
+    return /^\/[a-z]{2}(\/|$)/i.test(pathname);
+  } catch {
+    return false;
+  }
+}
+
+function normalizePageUrl(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    u.hash = ""; // strip fragment — same content, different anchor
+    let str = u.toString();
+    if (u.pathname.length > 1 && str.endsWith("/")) str = str.slice(0, -1);
+    return str;
+  } catch {
+    return rawUrl;
+  }
+}
+
 // ---------- Cleanup job ----------
 function cleanupOldReports() {
   if (!fs.existsSync(REPORTS_DIR)) return;
@@ -69,127 +90,150 @@ function cleanupOldReports() {
 // ---------- Routes ----------
 app.get("/audit", async (req, res) => {
   const url = req.query.url;
+  const maxPages = Math.min(Math.max(parseInt(req.query.maxPages) || MAX_CRAWL_PAGES, 1), 50);
 
   if (!url) {
-    return res.status(400).json({
-      success: false,
-      message: "Please provide a URL",
-    });
+    return res.status(400).json({ success: false, message: "Please provide a URL" });
   }
 
-  // const safe = await isUrlSafe(url);
-  // if (!safe) {
-  //   return res.status(400).json({
-  //     success: false,
-  //     message: "URL is invalid or points to a disallowed address",
-  //   });
-  // }
+  let baseOrigin;
+  try {
+    baseOrigin = new URL(url).origin;
+  } catch {
+    return res.status(400).json({ success: false, message: "Invalid URL provided" });
+  }
 
-  let page;
-  let netCapture;
-  const consoleLogs = [];
+  // Pre-serialise custom check functions once — functions can't cross the
+  // Node→browser boundary via structured clone so we stringify + reconstruct.
+  const serializedChecks = customChecks.map((check) => ({
+    ...check,
+    evaluate: check.evaluate.toString(),
+  }));
+
+  const visited = new Set();
+  const queue = [url];
+  const pageResults = [];
 
   try {
-    page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 800 });
+    while (queue.length > 0 && pageResults.length < maxPages) {
+      const currentUrl = queue.shift();
+      const normalizedUrl = normalizePageUrl(currentUrl);
 
-    // Attach network capture BEFORE navigation so we don't miss early requests
-    netCapture = await attachNetworkCapture(page);
+      if (visited.has(normalizedUrl)) continue;
+      visited.add(normalizedUrl);
 
-    // Capture console output (errors/warnings/logs) alongside network data
-    page.on("console", (msg) => {
-      consoleLogs.push({
-        type: msg.type(),
-        text: msg.text(),
-        location: msg.location(),
-      });
-    });
+      let page;
+      let netCapture;
+      const consoleLogs = [];
 
-    page.on("pageerror", (err) => {
-      consoleLogs.push({
-        type: "pageerror",
-        text: err.message,
-        location: null,
-      });
-    });
+      try {
+        page = await browser.newPage();
+        await page.setViewport({ width: 1280, height: 800 });
 
-    let response;
-    try {
-      response = await page.goto(url, {
-        waitUntil: ["domcontentloaded", "networkidle2"],
-        timeout: 60000,
-      });
-    } catch (navError) {
+        netCapture = await attachNetworkCapture(page);
+
+        page.on("console", (msg) => {
+          consoleLogs.push({ type: msg.type(), text: msg.text(), location: msg.location() });
+        });
+        page.on("pageerror", (err) => {
+          consoleLogs.push({ type: "pageerror", text: err.message, location: null });
+        });
+
+        let response;
+        try {
+          response = await page.goto(currentUrl, {
+            waitUntil: ["domcontentloaded", "networkidle2"],
+            timeout: 60000,
+          });
+        } catch (navError) {
+          console.warn(`Skipping ${currentUrl}: ${navError.message}`);
+          continue;
+        }
+
+        const finalUrl = page.url();
+        if (!response || finalUrl === "about:blank") continue;
+        if (!response.ok() && response.status() >= 400) continue;
+
+        // Re-anchor baseOrigin to the landing page's actual origin so that
+        // http→https or non-www→www redirects don't silently drop all links.
+        if (pageResults.length === 0) {
+          try { baseOrigin = new URL(finalUrl).origin; } catch {}
+        }
+
+        await page.evaluate(axeSource);
+
+        await page.evaluate(
+          (checks, rules) => {
+            const reconstructedChecks = checks.map((check) => ({
+              ...check,
+              // eslint-disable-next-line no-new-func
+              evaluate: new Function("return (" + check.evaluate + ").apply(this, arguments);"),
+            }));
+            axe.configure({ checks: reconstructedChecks, rules });
+          },
+          serializedChecks,
+          customRules
+        );
+
+        const results = await page.evaluate(async () => axe.run());
+
+        // Only collect links from the homepage (first page) — no recursive crawl.
+        // Sub-pages' links are ignored so we audit homepage + its direct children only.
+        if (pageResults.length === 0) {
+          const newLinks = await page.evaluate((origin) => {
+            const hrefs = new Set();
+            document.querySelectorAll("a[href]").forEach((a) => {
+              try {
+                const u = new URL(a.href);
+                if (u.origin === origin && !a.href.includes("#")) hrefs.add(u.toString());
+              } catch {}
+            });
+            document.querySelectorAll("form[action]").forEach((f) => {
+              if (!f.method || f.method.toLowerCase() === "get") {
+                try {
+                  const u = new URL(f.action);
+                  if (u.origin === origin) hrefs.add(u.toString());
+                } catch {}
+              }
+            });
+            return Array.from(hrefs);
+          }, baseOrigin);
+
+          for (const link of newLinks) {
+            if (isLocaleUrl(link)) continue; // skip /fr/, /de/, /es/ etc. locale variants
+            const norm = normalizePageUrl(link);
+            if (!visited.has(norm) && !queue.some((q) => normalizePageUrl(q) === norm)) {
+              queue.push(link);
+            }
+          }
+        }
+
+        const networkRecords = netCapture.getRecords();
+        const networkSummary = netCapture.getSummary(networkRecords);
+
+        pageResults.push({
+          url: currentUrl,
+          finalUrl,
+          accessibility: results,
+          network: { summary: networkSummary, requests: networkRecords },
+          console: consoleLogs,
+        });
+
+      } catch (pageError) {
+        console.warn(`Error on ${currentUrl}: ${pageError.message}`);
+      } finally {
+        if (netCapture) await netCapture.detach();
+        if (page) await page.close();
+      }
+    }
+
+    if (pageResults.length === 0) {
       return res.status(400).json({
         success: false,
-        message: `Failed to load URL: ${navError.message}`,
+        message:
+          "Failed to load the provided URL. The site may be blocking automated browsers or redirecting unexpectedly.",
       });
     }
-
-    // Defensive check: goto() resolving without throwing does NOT guarantee
-    // the target page actually loaded. Sites with redirects, anti-bot
-    // challenges, or slow/odd load behavior can leave Puppeteer reporting
-    // success while the page is still about:blank or an error page.
-    const finalUrl = page.url();
-    if (!response || finalUrl === "about:blank") {
-      return res.status(502).json({
-        success: false,
-        message: `Navigation did not land on the target page (ended at ${finalUrl}). The site may be blocking automated browsers, redirecting unexpectedly, or timing out silently.`,
-      });
-    }
-
-    if (!response.ok() && response.status() >= 400) {
-      return res.status(502).json({
-        success: false,
-        message: `Target page responded with HTTP ${response.status()}`,
-      });
-    }
-
-    // Inject axe-core, then register our custom rules/checks before running.
-    //
-    // NOTE: functions can't cross the Node -> browser boundary via
-    // page.evaluate() args (structured clone strips them). We serialize each
-    // check's evaluate function to a string here, then reconstruct it with
-    // `new Function(...)` inside the page context.
-    await page.evaluate(axeSource);
-
-    const serializedChecks = customChecks.map((check) => ({
-      ...check,
-      evaluate: check.evaluate.toString(),
-    }));
-
-    await page.evaluate(
-      (checks, rules) => {
-        const reconstructedChecks = checks.map((check) => ({
-          ...check,
-          // eslint-disable-next-line no-new-func
-          evaluate: new Function(
-            "return (" + check.evaluate + ").apply(this, arguments);"
-          ),
-        }));
-        axe.configure({ checks: reconstructedChecks, rules });
-      },
-      serializedChecks,
-      customRules
-    );
-
-    const results = await page.evaluate(async () => {
-      return await axe.run();
-    });
-
-    // Pull finalized network records + summary
-    const networkRecords = netCapture.getRecords();
-    const networkSummary = netCapture.getSummary(networkRecords);
-
-    // Split out which violations came from our custom rules vs. axe's
-    // built-in ruleset, so it's obvious in the response what's new
-    const customRuleIdSet = new Set(customRules.map((r) => r.id));
-    const customViolations = results.violations.filter((v) =>
-      customRuleIdSet.has(v.id)
-    );
-    const builtInViolations = results.violations.filter(
-      (v) => !customRuleIdSet.has(v.id)
-    );
 
     fs.mkdirSync(REPORTS_DIR, { recursive: true });
 
@@ -200,14 +244,8 @@ app.get("/audit", async (req, res) => {
 
     const combinedReport = {
       requestedUrl: url,
-      finalUrl,
       timestamp,
-      accessibility: results,
-      network: {
-        summary: networkSummary,
-        requests: networkRecords,
-      },
-      console: consoleLogs,
+      pages: pageResults,
     };
 
     fs.writeFileSync(
@@ -215,38 +253,30 @@ app.get("/audit", async (req, res) => {
       JSON.stringify(combinedReport, null, 2)
     );
 
-    // Single self-contained HTML report covering accessibility, network,
-    // and console data - no CDN dependencies, renders correctly offline.
     const html = buildHtmlReport(combinedReport, CUSTOM_RULE_IDS);
-
     fs.writeFileSync(path.join(REPORTS_DIR, htmlFilename), html);
+
+    const totalViolations = pageResults.reduce((sum, p) => sum + (p.accessibility.violations || []).length, 0);
+    const totalPasses    = pageResults.reduce((sum, p) => sum + (p.accessibility.passes    || []).length, 0);
+    const customRuleIdSet = new Set(customRules.map((r) => r.id));
+    const totalCustom = pageResults.reduce(
+      (sum, p) => sum + (p.accessibility.violations || []).filter((v) => customRuleIdSet.has(v.id)).length,
+      0
+    );
 
     res.json({
       success: true,
-      violations: results.violations.length,
-      builtInViolations: builtInViolations.length,
-      customRuleViolations: customViolations.length,
-      customRuleDetails: customViolations.map((v) => ({
-        id: v.id,
-        impact: v.impact,
-        description: v.description,
-        nodes: v.nodes.length,
-      })),
-      passes: results.passes.length,
-      network: networkSummary,
-      consoleErrors: consoleLogs.filter((l) => l.type === "error" || l.type === "pageerror").length,
+      pagesScanned: pageResults.length,
+      violations: totalViolations,
+      customRuleViolations: totalCustom,
+      passes: totalPasses,
       report: `/reports/${htmlFilename}`,
       reportJson: `/reports/${jsonFilename}`,
     });
+
   } catch (error) {
     console.error(error);
-    res.status(500).json({
-      success: false,
-      error: error.message,
-    });
-  } finally {
-    if (netCapture) await netCapture.detach();
-    if (page) await page.close();
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -262,41 +292,27 @@ async function start() {
   fs.mkdirSync(REPORTS_DIR, { recursive: true });
 
   browser = await puppeteer.launch({
-    headless: true,          // Puppeteer 22+ maps this to --headless=new (no visible window)
-    ignoreHTTPSErrors: true, // don't bail on self-signed certs on staging sites
-    // NOTE: pipe:true is intentionally omitted — Windows has IPC-pipe timing
-    //       issues with Chrome that can cause a black window to flash.
-
+    headless: true,
+    ignoreHTTPSErrors: true,
     args: [
-      // ── Headless guarantee ─────────────────────────────────────────────────
-      "--headless=new",                    // belt-and-suspenders: Chrome native headless
-      "--window-position=-32000,-32000",   // push any stray window completely off-screen
-      "--window-size=1280,800",            // explicit size prevents Chrome guessing
-
-      // ── Sandbox (required in most CI / container environments) ────────────
+      "--headless=new",
+      "--window-position=-32000,-32000",
+      "--window-size=1280,800",
       "--no-sandbox",
       "--disable-setuid-sandbox",
-
-      // ── Memory & process model ─────────────────────────────────────────────
-      "--disable-dev-shm-usage",           // prevents /dev/shm exhaustion on Linux
-      "--disable-gpu",                     // no GPU process = no GPU VRAM allocation
-      "--disable-software-rasterizer",     // skip the fallback software GL layer
-      "--no-zygote",                       // skip the zygote helper process
-      "--renderer-process-limit=1",        // cap concurrent renderer processes
-      "--js-flags=--max-old-space-size=512", // hard cap V8 heap at 512 MB per page
-
-      // ── Disk / network cache ───────────────────────────────────────────────
-      "--disk-cache-size=0",               // no persistent disk cache between audits
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--disable-software-rasterizer",
+      "--no-zygote",
+      "--renderer-process-limit=1",
+      "--js-flags=--max-old-space-size=512",
+      "--disk-cache-size=0",
       "--media-cache-size=0",
-
-      // ── Color accuracy (critical for contrast ratio calculations) ──────────
-      "--force-color-profile=srgb",        // consistent sRGB for getComputedStyle color values
-
-      // ── Unused services (each removed = fewer threads + less RAM) ─────────
+      "--force-color-profile=srgb",
       "--disable-background-networking",
       "--disable-background-timer-throttling",
       "--disable-backgrounding-occluded-windows",
-      "--disable-breakpad",                // no crash reporter
+      "--disable-breakpad",
       "--disable-client-side-phishing-detection",
       "--disable-component-update",
       "--disable-default-apps",
@@ -306,13 +322,13 @@ async function start() {
       "--disable-hang-monitor",
       "--disable-ipc-flooding-protection",
       "--disable-notifications",
-      "--disable-popup-blocking",          // keep open — some sites redirect via popup
+      "--disable-popup-blocking",
       "--disable-print-preview",
       "--disable-renderer-backgrounding",
       "--disable-speech-api",
       "--disable-sync",
       "--disable-translate",
-      "--disable-webgl",                   // WebGL unused for accessibility auditing
+      "--disable-webgl",
       "--hide-scrollbars",
       "--metrics-recording-only",
       "--mute-audio",
@@ -322,7 +338,7 @@ async function start() {
       "--password-store=basic",
       "--use-mock-keychain",
       "--safebrowsing-disable-auto-update",
-      "--log-level=3",                     // only fatal messages in Chrome's own log
+      "--log-level=3",
     ],
   });
 
